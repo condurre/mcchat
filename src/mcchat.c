@@ -7,15 +7,22 @@
  * group and every other member on that link receives them directly.
  */
 
-/* On macOS, <netinet6/in6.h> hides struct ipv6_mreq and other IPv6
- * multicast/advanced API definitions unless _DARWIN_C_SOURCE (or no
- * _POSIX_C_SOURCE at all) is defined; __APPLE_USE_RFC_3542 additionally
- * exposes the RFC 3542 socket options we don't strictly need but keep
- * for portability of related definitions. Define both instead of
- * _POSIX_C_SOURCE so these headers are fully visible on macOS while
- * still building fine on Linux/glibc. */
+/* Feature-test macros needed to expose POSIX/BSD declarations (getopt,
+ * addrinfo, struct ipv6_mreq, ...) under -std=c11, which defines
+ * __STRICT_ANSI__ and otherwise hides them.
+ *
+ * On glibc/Linux, _POSIX_C_SOURCE plus _DEFAULT_SOURCE is enough.
+ * On macOS, <netinet6/in6.h> instead hides struct ipv6_mreq (and other
+ * advanced IPv6 API bits) whenever _POSIX_C_SOURCE is defined at all, so
+ * we use _DARWIN_C_SOURCE there instead; __APPLE_USE_RFC_3542 additionally
+ * exposes related RFC 3542 socket option definitions. */
+#if defined(__APPLE__)
 #define _DARWIN_C_SOURCE
 #define __APPLE_USE_RFC_3542
+#else
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
