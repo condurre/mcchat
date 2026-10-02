@@ -57,13 +57,39 @@ static void on_signal(int sig) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s -i <interface> [-g <group>] [-p <port>] [-n <nickname>]\n"
+        "Usage: %s -i <interface> [-g <group>] [-p <port>] [-n <nickname>] [-f <path>]\n"
         "\n"
         "  -i  network interface to use for multicast (required), e.g. en0\n"
         "  -g  IPv6 multicast group address (default: %s)\n"
         "  -p  UDP port (default: %s)\n"
-        "  -n  nickname to prefix messages with (default: your username)\n",
+        "  -n  nickname to prefix messages with (default: your username)\n"
+        "  -f  send the contents of <path> as chat messages, one per line,\n"
+        "      and exit immediately instead of starting interactive chat\n"
+        "\n"
+        "Each option can also be set via an environment variable; an explicit\n"
+        "command-line option always overrides the matching environment variable:\n"
+        "\n"
+        "  MCCHAT_INTERFACE  same as -i\n"
+        "  MCCHAT_GROUP      same as -g\n"
+        "  MCCHAT_PORT       same as -p\n"
+        "  MCCHAT_NICKNAME   same as -n\n",
         prog, DEFAULT_GROUP, DEFAULT_PORT);
+}
+
+/* Build "<nickname>: <line>" into msg (truncating to fit MAX_MSG, same as
+ * the UDP payload limit) and send it to dst. Returns what sendto() returns. */
+static ssize_t send_chat_line(int sock, const struct sockaddr_in6 *dst,
+                               const char *nickname, const char *line) {
+    char msg[MAX_MSG];
+    int mlen = snprintf(msg, sizeof(msg), "%s: %s", nickname, line);
+    if (mlen < 0) {
+        mlen = 0;
+    }
+    if ((size_t)mlen >= sizeof(msg)) {
+        mlen = sizeof(msg) - 1;
+    }
+    return sendto(sock, msg, (size_t)mlen, 0,
+                   (const struct sockaddr *)dst, sizeof(*dst));
 }
 
 /* Receiver thread: prints any datagram that arrives on the multicast group. */
@@ -92,20 +118,35 @@ static void *receiver_thread(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    const char *ifname = NULL;
-    const char *group = DEFAULT_GROUP;
-    const char *port = DEFAULT_PORT;
+    /* Environment variables provide defaults; explicit command-line options
+     * (parsed below) override them on a per-option basis. */
+    const char *ifname = getenv("MCCHAT_INTERFACE");
+    const char *group = getenv("MCCHAT_GROUP");
+    if (!group || group[0] == '\0') {
+        group = DEFAULT_GROUP;
+    }
+    const char *port = getenv("MCCHAT_PORT");
+    if (!port || port[0] == '\0') {
+        port = DEFAULT_PORT;
+    }
     char nickname[MAX_NICK] = {0};
+    const char *env_nickname = getenv("MCCHAT_NICKNAME");
+    if (env_nickname && env_nickname[0] != '\0') {
+        strncpy(nickname, env_nickname, sizeof(nickname) - 1);
+    }
+    const char *file_path = NULL;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:g:p:n:h")) != -1) {
+    while ((opt = getopt(argc, argv, "i:g:p:n:f:h")) != -1) {
         switch (opt) {
             case 'i': ifname = optarg; break;
             case 'g': group = optarg; break;
             case 'p': port = optarg; break;
             case 'n':
+                memset(nickname, 0, sizeof(nickname));
                 strncpy(nickname, optarg, sizeof(nickname) - 1);
                 break;
+            case 'f': file_path = optarg; break;
             case 'h':
             default:
                 usage(argv[0]);
@@ -113,8 +154,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!ifname) {
-        fprintf(stderr, "error: -i <interface> is required\n\n");
+    if (!ifname || ifname[0] == '\0') {
+        fprintf(stderr,
+                "error: -i <interface> is required "
+                "(or set MCCHAT_INTERFACE)\n\n");
         usage(argv[0]);
         return 1;
     }
@@ -206,6 +249,56 @@ int main(int argc, char **argv) {
 
     char group_str[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, &group_addr.sin6_addr, group_str, sizeof(group_str));
+
+    /* File mode: send each line of <path> as a chat message and exit,
+     * without starting the receiver thread or interactive prompt. */
+    if (file_path) {
+        FILE *f = fopen(file_path, "r");
+        if (!f) {
+            fprintf(stderr, "error: cannot open '%s': %s\n",
+                    file_path, strerror(errno));
+            close(sock);
+            return 1;
+        }
+
+        printf("Joined [%s%%%s]:%s as '%s'. Sending '%s'...\n",
+               group_str, ifname, port, nickname, file_path);
+
+        int exit_code = 0;
+        char line[MAX_MSG];
+        while (fgets(line, sizeof(line), f)) {
+            size_t len = strlen(line);
+            if (len > 0 && line[len - 1] == '\n') {
+                line[len - 1] = '\0';
+                len--;
+            }
+            if (len == 0) {
+                continue;
+            }
+
+            errno = 0;
+            ssize_t sent = send_chat_line(sock, &group_addr, nickname, line);
+            if (sent < 0) {
+                fprintf(stderr, "error: sendto failed while sending '%s': %s\n",
+                        file_path, strerror(errno));
+                exit_code = 1;
+                break;
+            }
+        }
+        if (exit_code == 0 && ferror(f)) {
+            fprintf(stderr, "error: reading '%s' failed: %s\n",
+                    file_path, strerror(errno));
+            exit_code = 1;
+        }
+
+        fclose(f);
+        close(sock);
+        if (exit_code == 0) {
+            printf("Sent '%s'.\n", file_path);
+        }
+        return exit_code;
+    }
+
     printf("Joined [%s%%%s]:%s as '%s'. Type a message and press enter.\n",
            group_str, ifname, port, nickname);
 
@@ -235,18 +328,7 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        char msg[MAX_MSG];
-        int mlen = snprintf(msg, sizeof(msg), "%s: %s", nickname, line);
-        if (mlen < 0) {
-            mlen = 0;
-        }
-        if ((size_t)mlen >= sizeof(msg)) {
-            mlen = sizeof(msg) - 1;
-        }
-
-        ssize_t sent = sendto(sock, msg, (size_t)mlen, 0,
-                               (struct sockaddr *)&group_addr,
-                               sizeof(group_addr));
+        ssize_t sent = send_chat_line(sock, &group_addr, nickname, line);
         if (sent < 0) {
             perror("sendto");
         }
